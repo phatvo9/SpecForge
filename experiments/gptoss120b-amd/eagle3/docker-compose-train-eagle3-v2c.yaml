@@ -1,0 +1,35 @@
+services:
+  eagle3-train-v2c:
+    image: lmsysorg/sglang:v0.5.10.post1-rocm700-mi35x
+    container_name: eagle3_train_v2c
+    shm_size: "64g"
+    ipc: host
+    network_mode: host
+    environment:
+      HF_TOKEN: "${HF_TOKEN}"
+      NCCL_DEBUG: "WARN"
+    volumes:
+      - /root/phat/SpecForge:/workspace/SpecForge
+      - /home/claudeuser/specforge_data:/workspace/data:ro
+      - /root/phat/SpecForge/experiments/gptoss120b/eagle3/train_eagle3_v2c.sh:/workspace/train_eagle3_v2c.sh:ro
+      - /data3/phat/specforge/training:/workspace/checkpoints-v1:ro
+      - /data3/phat/specforge/training-v2:/workspace/checkpoints-v2:ro
+      - /data3/phat/specforge/training-v2c:/workspace/checkpoints-v2c
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    tty: true
+    cap_add:
+      - SYS_PTRACE
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    group_add:
+      - video
+    privileged: true
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    working_dir: /workspace
+    command: bash /workspace/train_eagle3_v2c.sh

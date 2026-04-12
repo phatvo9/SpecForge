@@ -1,0 +1,36 @@
+services:
+  dflash-bench:
+    image: dflash-bench:latest
+    container_name: dflash_bench
+    shm_size: "64g"
+    ipc: host
+    network_mode: host
+    environment:
+      HF_TOKEN: "${HF_TOKEN}"
+      SGLANG_RECORD_STEP_TIME: "1"
+      SGLANG_ENABLE_SPEC_V2: "1"
+      SGLANG_ENABLE_DFLASH_SPEC_V2: "1"
+      NCCL_DEBUG: "WARN"
+      AITER_LOG_LEVEL: "WARNING"
+    volumes:
+      - /root/phat/SpecForge:/workspace/SpecForge
+      - /home/claudeuser/specforge_data:/workspace/data:ro
+      - /data3/phat/specforge/dflash:/workspace/checkpoints
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    tty: true
+    cap_add:
+      - SYS_PTRACE
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    group_add:
+      - video
+    privileged: true
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    working_dir: /workspace
+    command: bash /workspace/SpecForge/experiments/gptoss120b/dflash/bench_dflash.sh

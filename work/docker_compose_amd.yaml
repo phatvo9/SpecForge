@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  sglang:
+    image: lmsysorg/sglang:v0.5.10.post1-rocm700-mi35x
+
+    container_name: sglang_amd_server
+    restart: unless-stopped
+    shm_size: "32g"
+    ipc: host
+    network_mode: host
+    environment:
+      HF_TOKEN: "${HF_TOKEN}"   # pick up from your env file or export before `docker compose up`
+      SGLANG_ENABLE_SPEC_V2: 1
+
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    tty: true
+    cap_add:
+      - SYS_PTRACE
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    group_add:
+      - video
+    privileged: true
+    ulimits:
+      memlock: -1
+      stack: 6710886
+    working_dir: /workspace
+    command: >
+      python -m sglang.launch_server
+      --model-path ${MODEL}
+      --host 0.0.0.0
+      --port 23334
+      --mem-fraction-static 0.7
+      --allow-auto-truncate --stream-interval 10
+      --served-model-name model
+      --constrained-json-disable-any-whitespace 
+      --max-running-requests 128 --sampling-defaults openai --decode-log-interval 10
+      

@@ -1,0 +1,34 @@
+services:
+  dflash-train:
+    image: lmsysorg/sglang:v0.5.10.post1-rocm700-mi35x
+    container_name: dflash_train
+    shm_size: "64g"
+    ipc: host
+    network_mode: host
+    environment:
+      HF_TOKEN: "${HF_TOKEN}"
+      NCCL_DEBUG: "WARN"
+      AITER_LOG_LEVEL: "WARNING"
+    volumes:
+      - /root/phat/SpecForge:/workspace/SpecForge
+      - /home/claudeuser/specforge_data:/workspace/data:ro
+      - /root/phat/SpecForge/experiments/gptoss120b/dflash/train_dflash.sh:/workspace/train_dflash.sh:ro
+      - /data3/phat/specforge/dflash:/workspace/checkpoints
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    tty: true
+    cap_add:
+      - SYS_PTRACE
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    group_add:
+      - video
+    privileged: true
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    working_dir: /workspace
+    command: bash /workspace/train_dflash.sh

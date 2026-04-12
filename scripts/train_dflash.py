@@ -545,6 +545,43 @@ def main():
                     }
                 )
 
+            if (
+                eval_dataloader is not None
+                and global_step % args.eval_interval == 0
+            ):
+                draft_model.eval()
+                eval_losses = []
+                eval_accs = []
+                with torch.no_grad():
+                    for eval_data in eval_dataloader:
+                        eval_input_ids = eval_data["input_ids"].cuda()
+                        eval_attention_mask = eval_data["attention_mask"].cuda()
+                        eval_loss_mask = eval_data["loss_mask"].cuda()
+                        eval_target_output = target_model.generate_dflash_data(
+                            eval_input_ids, eval_attention_mask, eval_loss_mask
+                        )
+                        eval_hidden_states = eval_target_output.hidden_states.cuda()
+                        eval_loss, eval_accuracy = dflash_model(
+                            input_ids=eval_input_ids,
+                            hidden_states=eval_hidden_states,
+                            loss_mask=eval_loss_mask,
+                        )
+                        eval_losses.append(eval_loss.item())
+                        eval_accs.append(eval_accuracy.item())
+                avg_eval_loss = sum(eval_losses) / len(eval_losses)
+                avg_eval_acc = sum(eval_accs) / len(eval_accs)
+                record_metrics(
+                    args,
+                    avg_eval_loss,
+                    avg_eval_acc,
+                    global_step,
+                    tracker,
+                    optimizer,
+                    train_dataloader,
+                    mode="eval",
+                )
+                draft_model.train()
+
             if global_step % args.save_interval == 0:
                 save_checkpoint(
                     args, epoch, global_step, dflash_model, draft_model, optimizer

@@ -90,6 +90,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
     model_group.add_argument(
+        "--freeze-lm-head",
+        action="store_true",
+        default=False,
+        help="Freeze the lm_head weights during training",
+    )
+    model_group.add_argument(
         "--target-model-backend",
         type=str,
         default="sglang",
@@ -433,6 +439,9 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
+    if hasattr(draft_model, "lm_head") and args.freeze_lm_head:
+        draft_model.lm_head.weight.requires_grad = False
+        print_on_rank0("Froze lm_head weights")
     return draft_model_config, draft_model, ckpt_info, resume_state
 
 
