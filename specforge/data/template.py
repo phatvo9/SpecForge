@@ -324,3 +324,15 @@ TEMPLATE_REGISTRY.register(
         enable_thinking=True,
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="minimax-m2",
+    template=ChatTemplate(
+        assistant_header="]~b]ai",
+        user_header="]~b]user",
+        system_prompt="",
+        end_of_turn_token="[e~[",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)

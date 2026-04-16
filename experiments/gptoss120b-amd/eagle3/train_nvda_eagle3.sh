@@ -32,12 +32,11 @@ torchrun \
     --target-model-backend sglang \
     --sglang-attention-backend aiter \
     --sglang-mem-fraction-static 0.85 \
-    --sglang-context-length 16000 \
     --num-epochs 10 \
     --batch-size 2 \
     --draft-accumulation-steps 4 \
     --learning-rate 1e-4 \
-    --max-length 16000 \
+    --max-length 8192 \
     --chat-template gpt-oss \
     --cache-dir /workspace/cache \
     --dist-timeout 120 \

@@ -34,14 +34,13 @@ torchrun \
     --target-model-backend sglang \
     --sglang-attention-backend aiter \
     --sglang-mem-fraction-static 0.85 \
-    --sglang-context-length 16000 \
     --num-epochs 13 \
     --batch-size 2 \
     --accumulation-steps 4 \
     --learning-rate 6e-4 \
     --warmup-ratio 0.04 \
     --max-grad-norm 1.0 \
-    --max-length 16000 \
+    --max-length 8192 \
     --chat-template gpt-oss \
     --attention-backend sdpa \
     --block-size 16 \

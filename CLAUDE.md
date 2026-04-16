@@ -63,6 +63,16 @@ Supports Tensor Parallelism (TP), Data Parallelism (DP), Sequence Parallelism (S
 - Code formatting: Black (line length 88), isort with Black profile, 4-space indentation for Python.
 
 
+## Training Session Log
+
+See [docs/session-summary-2026-04-13.md](docs/session-summary-2026-04-13.md) for full details on:
+- gpt-oss-120b EAGLE3/DFlash training (completed)
+- MiniMax-M2.7 EAGLE3 training (in progress)
+- All HF repos, checkpoints, data paths, configs, code changes
+- Key learnings and next steps
+
+See [docs/specforge-training-guide.md](docs/specforge-training-guide.md) for how SpecForge training works (data pipeline, EAGLE3/DFlash architecture, loss functions, metrics).
+
 ## Data
 
 ### GPTOSS-120b

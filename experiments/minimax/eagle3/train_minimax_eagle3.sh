@@ -11,9 +11,11 @@ export PYTHONPATH="/workspace/SpecForge:$PYTHONPATH"
 
 pip install openai-harmony accelerate datasets yunchang wandb tensorboard pydantic tqdm psutil numpy 2>&1 | tail -10
 
-# Best v2 checkpoint (lowest loss at step 10000)
-# v1 best checkpoint (accept_len 1.50)
-CKPT_DIR="/workspace/checkpoints-v1/eagle3/gpt-oss-120b/epoch_7_step_14000"
+# MiniMax-M2.7 EAGLE3 training
+# Following M2.5-Eagle3 training recipe:
+# - LR: 2e-5, batch 1, max_length 2048, TTT=7
+# - Draft: hidden=3072, 1 layer, 24 heads, 8 KV, intermediate=8192
+# - Aux layers: [1, 30, 59] for M2.7's 62 layers
 
 NUM_GPUS=3
 TP_SIZE=1
@@ -22,25 +24,27 @@ torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     /workspace/data/train_eagle3_wrapper.py \
-    --target-model-path mshojaei77/gpt-oss-120b \
-    --ckpt-dir "$CKPT_DIR" \
-    --train-data-path /workspace/data/gptoss-eagle3-train-v2.jsonl \
-    --eval-data-path /workspace/data/gptoss-eagle3-train-v3-aabench.jsonl \
+    --target-model-path MiniMaxAI/MiniMax-M2.7 \
+    --draft-model-config /workspace/SpecForge/configs/minimax-m2.7-eagle3.json \
+    --train-data-path /workspace/data/minimax2.7-spec-data/train.jsonl \
+    --eval-data-path /workspace/data/minimax2.7-spec-data/eval.jsonl \
     --build-dataset-num-proc 16 \
-    --output-dir /workspace/checkpoints-v2b/eagle3/gpt-oss-120b/ \
+    --output-dir /workspace/checkpoints/minimax-m2.7-eagle3/ \
     --tp-size $TP_SIZE \
     --target-model-backend sglang \
     --sglang-attention-backend aiter \
     --sglang-mem-fraction-static 0.85 \
-    --num-epochs 10 \
-    --batch-size 2 \
+    --trust-remote-code \
+    --num-epochs 9 \
+    --batch-size 1 \
     --draft-accumulation-steps 4 \
-    --learning-rate 1e-4 \
-    --max-length 8192 \
-    --chat-template gpt-oss \
+    --learning-rate 2e-5 \
+    --max-length 2048 \
+    --ttt-length 7 \
+    --chat-template minimax-m2 \
     --cache-dir /workspace/cache \
     --dist-timeout 120 \
-    --save-interval 2000 \
-    --eval-interval 2000 \
+    --save-interval 500 \
+    --eval-interval 500 \
     --log-interval 50 \
     --report-to tensorboard
