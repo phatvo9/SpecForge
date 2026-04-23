@@ -174,6 +174,18 @@ class SGLangBackendArgs:
             default=1,
             help="The ep size of the SGLang backend",
         )
+        parser.add_argument(
+            "--sglang-max-total-tokens",
+            type=int,
+            default=None,
+            help="Max total tokens in KV cache. Defaults to batch_size * max_length if not set.",
+        )
+        parser.add_argument(
+            "--sglang-max-running-requests",
+            type=int,
+            default=None,
+            help="Max concurrent requests. Defaults to batch_size if not set.",
+        )
 
     @staticmethod
     def from_args(args: argparse.Namespace) -> "SGLangBackendArgs":
@@ -191,12 +203,18 @@ class SGLangBackendArgs:
             sglang_piecewise_cuda_graph_tokens=args.sglang_piecewise_cuda_graph_tokens,
             sglang_ep_size=args.sglang_ep_size,
             sglang_max_running_requests=(
-                args.target_batch_size if hasattr(args, "target_batch_size") else None
+                args.sglang_max_running_requests
+                if hasattr(args, "sglang_max_running_requests") and args.sglang_max_running_requests is not None
+                else (args.target_batch_size if hasattr(args, "target_batch_size") else None)
             ),
             sglang_max_total_tokens=(
-                args.target_batch_size * args.max_length
-                if hasattr(args, "target_batch_size") and hasattr(args, "max_length")
-                else None
+                args.sglang_max_total_tokens
+                if hasattr(args, "sglang_max_total_tokens") and args.sglang_max_total_tokens is not None
+                else (
+                    args.target_batch_size * args.max_length
+                    if hasattr(args, "target_batch_size") and hasattr(args, "max_length")
+                    else None
+                )
             ),
         )
 

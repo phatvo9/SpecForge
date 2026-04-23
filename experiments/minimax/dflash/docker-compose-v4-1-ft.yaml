@@ -1,7 +1,7 @@
 services:
-  minimax-dflash-train:
+  dflash-v4-1-ft:
     image: lmsysorg/sglang:v0.5.10.post1-rocm700-mi35x
-    container_name: minimax_dflash_train
+    container_name: dflash_v4_1_ft
     shm_size: "64g"
     ipc: host
     network_mode: host

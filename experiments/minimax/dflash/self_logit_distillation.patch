@@ -1,0 +1,303 @@
+diff --git a/scripts/train_dflash.py b/scripts/train_dflash.py
+index 15404a4..bd211bc 100755
+--- a/scripts/train_dflash.py
++++ b/scripts/train_dflash.py
+@@ -80,6 +80,17 @@ def parse_args():
+         help="Gamma for exponential loss decay weighting (paper Eq.4). "
+         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
+     )
++    model_group.add_argument(
++        "--self-logit-distillation",
++        action="store_true",
++        help="Use target model logits as soft labels (KL divergence) instead of hard CE.",
++    )
++    model_group.add_argument(
++        "--distillation-temperature",
++        type=float,
++        default=1.0,
++        help="Temperature for self-logit distillation. Default: 1.0.",
++    )
+     model_group.add_argument(
+         "--embedding-key",
+         type=str,
+@@ -434,6 +445,39 @@ def main():
+         trust_remote_code=args.trust_remote_code,
+     )
+ 
++    # Load proper lm_head weight for distillation (bypasses FP8 loading issues)
++    distill_lm_head_weight = None
++    if args.self_logit_distillation:
++        from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead as _TEH
++        import glob
++        from safetensors import safe_open
++
++        lm_head_key = args.lm_head_key or "lm_head.weight"
++        model_path = args.target_model_path
++        if not os.path.exists(model_path):
++            from huggingface_hub import snapshot_download
++            model_path = snapshot_download(model_path, cache_dir=args.cache_dir)
++
++        # Find the safetensors file containing lm_head
++        index_file = os.path.join(model_path, "model.safetensors.index.json")
++        if os.path.exists(index_file):
++            import json as _json
++            with open(index_file) as f:
++                weight_map = _json.load(f).get("weight_map", {})
++            if lm_head_key in weight_map:
++                sf_file = os.path.join(model_path, weight_map[lm_head_key])
++                with safe_open(sf_file, framework="pt", device="cuda") as sf:
++                    distill_lm_head_weight = sf.get_tensor(lm_head_key).to(torch.bfloat16)
++                print_on_rank0(
++                    f"Loaded distillation lm_head weight: {distill_lm_head_weight.shape}"
++                )
++        if distill_lm_head_weight is None:
++            print_on_rank0("WARNING: Could not load lm_head for distillation, falling back to target_components")
++            distill_lm_head_weight = target_components.lm_head.weight
++            if distill_lm_head_weight.dim() == 1:
++                h = draft_model.config.hidden_size
++                distill_lm_head_weight = distill_lm_head_weight.view(-1, h)
++
+     dflash_model = OnlineDFlashModel(
+         draft_model=draft_model,
+         target_lm_head=target_components.lm_head,
+@@ -443,7 +487,13 @@ def main():
+         attention_backend=args.attention_backend,
+         num_anchors=args.num_anchors,
+         loss_decay_gamma=args.loss_decay_gamma,
++        self_logit_distillation=args.self_logit_distillation,
++        distillation_temperature=args.distillation_temperature,
+     )
++    if args.self_logit_distillation:
++        print_on_rank0(
++            f"Self-logit distillation enabled (temperature={args.distillation_temperature})"
++        )
+ 
+     dflash_model = FSDP(
+         dflash_model,
+@@ -511,10 +561,32 @@ def main():
+             )
+             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+ 
++            # Compute target logits for distillation if enabled
++            target_logits = None
++            if args.self_logit_distillation:
++                with torch.no_grad():
++                    if target_output.target_logits is not None:
++                        target_logits = target_output.target_logits.cuda()
++                    elif target_output.last_hidden_states is not None:
++                        target_logits = target_components.lm_head(
++                            target_output.last_hidden_states.cuda()
++                        )
++                    else:
++                        # SGLang backend: extract last layer features from concatenated hidden states
++                        # hidden_states is [batch, seq_len, num_features * hidden_size]
++                        # Last segment = last hidden_size elements = deepest layer features
++                        hs = hidden_states
++                        h_dim = draft_model.config.hidden_size  # e.g. 3072
++                        last_layer_hs = hs[..., -h_dim:].contiguous()
++                        target_logits = torch.nn.functional.linear(
++                            last_layer_hs, distill_lm_head_weight
++                        )
++
+             loss, accuracy = dflash_model(
+                 input_ids=input_ids,
+                 hidden_states=hidden_states,
+                 loss_mask=loss_mask,
++                target_logits=target_logits,
+             )
+ 
+             (loss / args.accumulation_steps).backward()
+@@ -568,10 +640,26 @@ def main():
+                             eval_input_ids, eval_attention_mask, eval_loss_mask
+                         )
+                         eval_hidden_states = eval_target_output.hidden_states.cuda()
++                        eval_target_logits = None
++                        if args.self_logit_distillation:
++                            if eval_target_output.target_logits is not None:
++                                eval_target_logits = eval_target_output.target_logits.cuda()
++                            elif eval_target_output.last_hidden_states is not None:
++                                eval_target_logits = target_components.lm_head(
++                                    eval_target_output.last_hidden_states.cuda()
++                                )
++                            else:
++                                hs = eval_hidden_states
++                                h_dim = draft_model.config.hidden_size
++                                last_layer_hs = hs[..., -h_dim:].contiguous()
++                                eval_target_logits = torch.nn.functional.linear(
++                                    last_layer_hs, distill_lm_head_weight
++                                )
+                         eval_loss, eval_accuracy = dflash_model(
+                             input_ids=eval_input_ids,
+                             hidden_states=eval_hidden_states,
+                             loss_mask=eval_loss_mask,
++                            target_logits=eval_target_logits,
+                         )
+                         eval_losses.append(eval_loss.item())
+                         eval_accs.append(eval_accuracy.item())
+diff --git a/specforge/core/dflash.py b/specforge/core/dflash.py
+index 35a5dd8..bb2bac2 100644
+--- a/specforge/core/dflash.py
++++ b/specforge/core/dflash.py
+@@ -106,6 +106,8 @@ class OnlineDFlashModel(nn.Module):
+         attention_backend: str = "flex_attention",
+         num_anchors: int = 512,
+         loss_decay_gamma: Optional[float] = None,
++        self_logit_distillation: bool = False,
++        distillation_temperature: float = 1.0,
+     ):
+         super().__init__()
+         self.draft_model = draft_model
+@@ -116,6 +118,8 @@ class OnlineDFlashModel(nn.Module):
+         self.attention_backend = attention_backend
+         self.num_anchors = num_anchors
+         self.loss_decay_gamma = loss_decay_gamma
++        self.self_logit_distillation = self_logit_distillation
++        self.distillation_temperature = distillation_temperature
+ 
+         self._cached_block_mask: Optional[BlockMask] = None
+         self._cached_seq_len: Optional[int] = None
+@@ -216,8 +220,14 @@ class OnlineDFlashModel(nn.Module):
+         input_ids: torch.Tensor,
+         hidden_states: torch.Tensor,
+         loss_mask: torch.Tensor,
++        target_logits: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        """Parallel block-wise training forward pass."""
++        """Parallel block-wise training forward pass.
++
++        Args:
++            target_logits: [batch, seq_len, vocab_size] target model logits for
++                self-logit distillation. Only used when self_logit_distillation=True.
++        """
+         bsz, seq_len = input_ids.shape
+         device = input_ids.device
+ 
+@@ -299,16 +309,38 @@ class OnlineDFlashModel(nn.Module):
+             )
+             weight_mask = weight_mask * decay_weights
+ 
+-        # --- Cross entropy ---
++        # --- Loss computation ---
+         flat_logits = logits.view(-1, logits.size(-1))
+         flat_targets = target_ids.view(-1)
+         flat_weights = weight_mask.view(-1)
+ 
+-        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+-        valid_token_count = flat_weights.sum() + 1e-6
+-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
++        if self.self_logit_distillation and target_logits is not None:
++            # Gather target logits at the same positions as labels
++            # target_logits: [bsz, seq_len, vocab] -> [bsz, n_anchors, block_size, vocab]
++            target_logits_gathered = torch.gather(
++                target_logits.unsqueeze(1).expand(-1, anchor_positions.size(1), -1, -1),
++                2,
++                safe_label_indices.unsqueeze(-1).expand(-1, -1, -1, target_logits.size(-1)),
++            )
++            flat_target_logits = target_logits_gathered.view(-1, target_logits.size(-1))
++
++            T = self.distillation_temperature
++            log_draft_probs = F.log_softmax(flat_logits / T, dim=-1)
++            target_probs = F.softmax(flat_target_logits / T, dim=-1)
++
++            # KL divergence per token (sum over vocab)
++            kl_per_token = F.kl_div(log_draft_probs, target_probs, reduction="none").sum(dim=-1)
++            kl_per_token = kl_per_token * (T * T)  # scale by T^2
++
++            valid_token_count = flat_weights.sum() + 1e-6
++            loss = (kl_per_token * flat_weights).sum() / valid_token_count
++        else:
++            # Standard hard cross-entropy
++            loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
++            valid_token_count = flat_weights.sum() + 1e-6
++            loss = (loss_per_token * flat_weights).sum() / valid_token_count
+ 
+-        # --- Accuracy ---
++        # --- Accuracy (always based on argmax, regardless of loss type) ---
+         with torch.no_grad():
+             pred_ids = torch.argmax(flat_logits, dim=-1)
+             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
+diff --git a/specforge/modeling/target/dflash_target_model.py b/specforge/modeling/target/dflash_target_model.py
+index 0df9382..48b3069 100644
+--- a/specforge/modeling/target/dflash_target_model.py
++++ b/specforge/modeling/target/dflash_target_model.py
+@@ -28,6 +28,8 @@ class DFlashTargetOutput:
+     input_ids: torch.Tensor  # [batch, seq_len]
+     attention_mask: torch.Tensor  # [batch, seq_len]
+     loss_mask: torch.Tensor  # [batch, seq_len]
++    last_hidden_states: Optional[torch.Tensor] = None  # [batch, seq_len, hidden_size] for distillation
++    target_logits: Optional[torch.Tensor] = None  # [batch, seq_len, vocab_size] for distillation
+ 
+ 
+ class DFlashTargetModel(ABC):
+@@ -163,6 +165,8 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
+             output = output.logits_output
+ 
+         input_lens = [len(req.origin_input_ids) for req in reqs]
++
++        # Capture multi-layer features (for draft context)
+         if (
+             hasattr(output, "aux_hidden_states")
+             and output.aux_hidden_states is not None
+@@ -175,10 +179,15 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
+         else:
+             raise ValueError("SGLang output does not contain hidden states.")
+ 
++        # SGLang backend: last_hidden_states not reliably available separately
++        # Distillation will use the fallback path in train_dflash.py
++        # (extract last hidden_size from concatenated features)
++        last_hidden_list = None
++
+         self.model_runner.req_to_token_pool.clear()
+         self.model_runner.token_to_kv_pool_allocator.clear()
+ 
+-        return hidden_states_list
++        return hidden_states_list, last_hidden_list
+ 
+     @torch.no_grad()
+     def generate_dflash_data(
+@@ -209,7 +218,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
+             data_cache.append((curr_ids, curr_attn, curr_loss))
+             reqs.append(req)
+ 
+-        hidden_states_list = self._extend(reqs)
++        hidden_states_list, last_hidden_list = self._extend(reqs)
+ 
+         # Stack back to batch
+         hidden_states = torch.cat([h.unsqueeze(0) for h in hidden_states_list], dim=0)
+@@ -217,11 +226,18 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
+         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
+         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)
+ 
++        last_hidden_states = None
++        if last_hidden_list is not None:
++            last_hidden_states = torch.cat(
++                [h.unsqueeze(0) for h in last_hidden_list], dim=0
++            )
++
+         return DFlashTargetOutput(
+             hidden_states=hidden_states,
+             input_ids=input_ids,
+             attention_mask=attention_mask,
+             loss_mask=loss_mask,
++            last_hidden_states=last_hidden_states,
+         )
+ 
+ 
+@@ -279,11 +295,17 @@ class HFDFlashTargetModel(DFlashTargetModel):
+         else:
+             hidden_states = outputs.hidden_states[-1]
+ 
++        # Last layer hidden states and logits for distillation
++        last_hidden_states = outputs.hidden_states[-1]
++        target_logits = outputs.logits if hasattr(outputs, "logits") else None
++
+         return DFlashTargetOutput(
+             hidden_states=hidden_states,
+             input_ids=input_ids,
+             attention_mask=attention_mask,
+             loss_mask=loss_mask,
++            last_hidden_states=last_hidden_states,
++            target_logits=target_logits,
+         )
+ 
+ 
