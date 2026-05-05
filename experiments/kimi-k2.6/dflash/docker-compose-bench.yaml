@@ -1,0 +1,44 @@
+services:
+  kimi-k2.6-dflash-bench:
+    image: lmsysorg/sglang:v0.5.10.post1-rocm700-mi35x
+    container_name: kimi_k2.6_dflash_bench
+    shm_size: "64g"
+    ipc: host
+    network_mode: host
+    environment:
+      HF_TOKEN: "${HF_TOKEN}"
+      NCCL_DEBUG: "WARN"
+      AITER_LOG_LEVEL: "WARNING"
+      AITER_JIT_DIR: "/workspace/cache/aiter_jit"
+      TRITON_CACHE_DIR: "/workspace/cache/triton"
+      TORCHINDUCTOR_CACHE_DIR: "/workspace/cache/torchinductor"
+      AMD_COMGR_CACHE_DIR: "/workspace/cache/comgr"
+      PIP_CACHE_DIR: "/workspace/cache/pip"
+      SGLANG_ENABLE_SPEC_V2: "1"
+      SGLANG_ENABLE_DFLASH_SPEC_V2: "1"
+    volumes:
+      - /root/phat/SpecForge:/workspace/SpecForge
+      - /root/phat/official_sglang:/workspace/official_sglang
+      - /home/claudeuser/specforge_data:/workspace/data:ro
+      - /data3/phat/specforge/dflash/kimi-k2.6:/workspace/checkpoints
+      - /data3/phat/.cache:/root/.cache
+      - /data3/phat/.cache/triton:/root/.triton
+      - /data3/phat/.cache/specforge:/workspace/cache
+      - /data3/phat/.cache/tmp:/tmp
+    tty: true
+    cap_add:
+      - SYS_PTRACE
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    group_add:
+      - video
+    privileged: true
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    working_dir: /workspace
+    command: bash /workspace/SpecForge/experiments/kimi-k2.6/dflash/bench_k25_dflash_on_k26.sh

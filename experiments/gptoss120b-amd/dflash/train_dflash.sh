@@ -18,7 +18,7 @@ pip install openai-harmony accelerate datasets yunchang wandb tensorboard pydant
 # mask_token_id=200000 from z-lab config
 
 NUM_GPUS=3
-TP_SIZE=1
+TP_SIZE=3
 
 torchrun \
     --standalone \

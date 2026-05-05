@@ -517,7 +517,11 @@ def main():
                 loss_mask=loss_mask,
             )
 
-            (loss / args.accumulation_steps).backward()
+            if torch.isnan(loss):
+                print_on_rank0(f"[WARN] NaN loss at step {global_step}, skipping backward")
+                optimizer.zero_grad()
+            else:
+                (loss / args.accumulation_steps).backward()
 
             if global_step % args.accumulation_steps == 0:
                 optimizer.step()
@@ -573,10 +577,13 @@ def main():
                             hidden_states=eval_hidden_states,
                             loss_mask=eval_loss_mask,
                         )
-                        eval_losses.append(eval_loss.item())
-                        eval_accs.append(eval_accuracy.item())
-                avg_eval_loss = sum(eval_losses) / len(eval_losses)
-                avg_eval_acc = sum(eval_accs) / len(eval_accs)
+                        eval_l = eval_loss.item()
+                        eval_a = eval_accuracy.item()
+                        if not math.isnan(eval_l):
+                            eval_losses.append(eval_l)
+                        eval_accs.append(eval_a)
+                avg_eval_loss = sum(eval_losses) / len(eval_losses) if eval_losses else float("nan")
+                avg_eval_acc = sum(eval_accs) / len(eval_accs) if eval_accs else 0.0
                 record_metrics(
                     args,
                     avg_eval_loss,

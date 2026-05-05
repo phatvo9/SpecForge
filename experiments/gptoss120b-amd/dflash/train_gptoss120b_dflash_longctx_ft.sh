@@ -2,7 +2,7 @@
 set -e
 
 # 1 GPU (GPU 5, ROCR 5)
-export ROCR_VISIBLE_DEVICES=5
+export ROCR_VISIBLE_DEVICES=5,7
 unset HIP_VISIBLE_DEVICES
 unset CUDA_VISIBLE_DEVICES
 unset GPU_DEVICE_ORDINAL
@@ -17,8 +17,8 @@ pip install openai-harmony accelerate datasets yunchang wandb==0.19.11 tensorboa
 # Data: gptoss eagle3 training data (~20K)
 # lr=1e-6, gamma=7, max_length=30720, anchors=1000
 
-NUM_GPUS=1
-TP_SIZE=1
+NUM_GPUS=2
+TP_SIZE=2
 
 torchrun \
     --standalone \
@@ -33,17 +33,17 @@ torchrun \
     --tp-size $TP_SIZE \
     --target-model-backend sglang \
     --sglang-attention-backend aiter \
-    --sglang-mem-fraction-static 0.95 \
-    --sglang-context-length 30720 \
-    --sglang-max-total-tokens 30720 \
+    --sglang-mem-fraction-static 0.9 \
+    --sglang-context-length 30000 \
+    --sglang-max-total-tokens 30000 \
     --trust-remote-code \
     --num-epochs 10 \
-    --batch-size 2 \
-    --accumulation-steps 2 \
+    --batch-size 1 \
+    --accumulation-steps 1 \
     --learning-rate 1e-6 \
     --warmup-ratio 0.05 \
     --max-grad-norm 0.7 \
-    --max-length 30720 \
+    --max-length 20480 \
     --chat-template gpt-oss \
     --attention-backend sdpa \
     --block-size 16 \

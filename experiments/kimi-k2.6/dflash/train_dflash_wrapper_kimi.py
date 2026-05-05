@@ -1,10 +1,45 @@
 """
-Compatibility wrapper for running SpecForge DFlash in the SGLang ROCm Docker image.
+Compatibility wrapper for running SpecForge DFlash training for Kimi K2.6.
 Patches version mismatches before importing SpecForge.
+If Docker SGLang doesn't support kimi_k25, falls back to local SGLang.
 """
+import sys
+import os
+import warnings
+import logging
+warnings.filterwarnings("ignore", message="Calling super.*encode")
+logging.getLogger("transformers_modules").setLevel(logging.ERROR)
+
+# Try to import kimi_k25 from Docker SGLang; if missing, prepend local SGLang
+try:
+    from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
+except (ImportError, ModuleNotFoundError):
+    local_sglang = "/workspace/official_sglang/python"
+    if os.path.isdir(local_sglang):
+        sys.path.insert(0, local_sglang)
+        print(f"[compat] Docker SGLang missing kimi_k25, using local: {local_sglang}")
+
 import inspect
 import runpy
-import sys
+
+# Force trust_remote_code for all HF calls (Kimi K2.6 needs custom code)
+os.environ["HF_HUB_TRUST_REMOTE_CODE"] = "1"
+os.environ["TRUST_REMOTE_CODE"] = "true"
+import transformers
+_orig_from_pretrained = transformers.AutoTokenizer.from_pretrained.__func__
+@classmethod
+def _patched_tokenizer_from_pretrained(cls, *args, **kwargs):
+    kwargs.setdefault("trust_remote_code", True)
+    return _orig_from_pretrained(cls, *args, **kwargs)
+transformers.AutoTokenizer.from_pretrained = _patched_tokenizer_from_pretrained
+
+_orig_config_from_pretrained = transformers.AutoConfig.from_pretrained.__func__
+@classmethod
+def _patched_config_from_pretrained(cls, *args, **kwargs):
+    kwargs.setdefault("trust_remote_code", True)
+    return _orig_config_from_pretrained(cls, *args, **kwargs)
+transformers.AutoConfig.from_pretrained = _patched_config_from_pretrained
+print("[compat] Patched AutoTokenizer/AutoConfig to trust_remote_code=True")
 
 # Shim 1: Add missing check_model_inputs to older transformers
 try:
