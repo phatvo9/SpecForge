@@ -2,7 +2,10 @@ import argparse
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+try:
+    from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+except ImportError:
+    ATTENTION_BACKEND_CHOICES = None
 
 
 @dataclass
@@ -96,7 +99,7 @@ class SGLangBackendArgs:
     sglang_enable_torch_compile: bool = True
     sglang_enable_dp_attention: bool = False
     sglang_enable_dp_lm_head: bool = False
-    sglang_enable_piecewise_cuda_graph: bool = False
+    sglang_disable_piecewise_cuda_graph: bool = True
     sglang_piecewise_cuda_graph_max_tokens: int = 4096
     sglang_piecewise_cuda_graph_tokens: List[int] = None
     sglang_ep_size: int = 1
@@ -198,7 +201,7 @@ class SGLangBackendArgs:
             sglang_enable_torch_compile=args.sglang_enable_torch_compile,
             sglang_enable_dp_attention=args.sglang_enable_dp_attention,
             sglang_enable_dp_lm_head=args.sglang_enable_dp_lm_head,
-            sglang_enable_piecewise_cuda_graph=args.sglang_enable_piecewise_cuda_graph,
+            sglang_disable_piecewise_cuda_graph=not getattr(args, "sglang_enable_piecewise_cuda_graph", False),
             sglang_piecewise_cuda_graph_max_tokens=args.sglang_piecewise_cuda_graph_max_tokens,
             sglang_piecewise_cuda_graph_tokens=args.sglang_piecewise_cuda_graph_tokens,
             sglang_ep_size=args.sglang_ep_size,
@@ -228,10 +231,46 @@ class SGLangBackendArgs:
             enable_torch_compile=self.sglang_enable_torch_compile,
             enable_dp_attention=self.sglang_enable_dp_attention,
             enable_dp_lm_head=self.sglang_enable_dp_lm_head,
-            enable_piecewise_cuda_graph=self.sglang_enable_piecewise_cuda_graph,
+            disable_piecewise_cuda_graph=self.sglang_disable_piecewise_cuda_graph,
             piecewise_cuda_graph_max_tokens=self.sglang_piecewise_cuda_graph_max_tokens,
             piecewise_cuda_graph_tokens=self.sglang_piecewise_cuda_graph_tokens,
             ep_size=self.sglang_ep_size,
             max_running_requests=self.sglang_max_running_requests,
             max_total_tokens=self.sglang_max_total_tokens,
+        )
+
+
+@dataclass
+class SGLangServerArgs:
+    """Arguments for connecting to a separate hidden states server."""
+
+    sglang_server_host: str = "127.0.0.1"
+    sglang_server_port: int = 29700
+
+    @staticmethod
+    def add_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--sglang-server-host",
+            type=str,
+            default="127.0.0.1",
+            help="Host of the hidden states server (for sglang-server backend)",
+        )
+        parser.add_argument(
+            "--sglang-server-port",
+            type=int,
+            default=29700,
+            help="Port of the hidden states server (for sglang-server backend)",
+        )
+
+    @staticmethod
+    def from_args(args: argparse.Namespace) -> "SGLangServerArgs":
+        return SGLangServerArgs(
+            sglang_server_host=getattr(args, "sglang_server_host", "127.0.0.1"),
+            sglang_server_port=getattr(args, "sglang_server_port", 29700),
+        )
+
+    def to_kwargs(self) -> Dict[str, Any]:
+        return dict(
+            host=self.sglang_server_host,
+            port=self.sglang_server_port,
         )

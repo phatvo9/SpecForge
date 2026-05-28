@@ -21,7 +21,7 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
 from datasets import load_dataset
-from specforge.args import SGLangBackendArgs, TrackerArgs
+from specforge.args import SGLangBackendArgs, SGLangServerArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
@@ -35,6 +35,8 @@ from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
+logger = logging.getLogger(__name__)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train DFlash Draft Model")
@@ -45,8 +47,8 @@ def parse_args():
         "--target-model-backend",
         type=str,
         default="hf",
-        choices=["sglang", "hf"],
-        help="Backend for target model: 'sglang' (service) or 'hf' (local)",
+        choices=["sglang", "sglang-server", "hf"],
+        help="Backend for target model: 'sglang' (torchrun), 'sglang-server' (separate server), or 'hf' (local)",
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
     model_group.add_argument("--block-size", type=int, default=16)
@@ -143,18 +145,24 @@ def parse_args():
     sglang_group = parser.add_argument_group("sglang backend")
     SGLangBackendArgs.add_args(sglang_group)
 
+    # SGLang server args (for sglang-server backend)
+    server_group = parser.add_argument_group("sglang server")
+    SGLangServerArgs.add_args(server_group)
+
     return parser.parse_args()
 
 
 def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     """Build target model (backend wrapper) and draft model."""
-    print_on_rank0(
+    _print(
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
     )
 
     target_model_kwargs = {}
     if args.target_model_backend == "sglang":
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+    elif args.target_model_backend == "sglang-server":
+        target_model_kwargs = SGLangServerArgs.from_args(args).to_kwargs()
 
     target_model = get_dflash_target_model(
         pretrained_model_name_or_path=args.target_model_path,
@@ -167,13 +175,13 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
 
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
-        print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
+        _print(f"Loaded draft config from {args.draft_config_path}")
         # Warn if command-line args differ from config
         if (
             hasattr(draft_config, "block_size")
             and draft_config.block_size != args.block_size
         ):
-            print_on_rank0(
+            _print(
                 f"Warning: checkpoint block_size ({draft_config.block_size}) differs from "
                 f"command-line arg ({args.block_size}). Using checkpoint value."
             )
@@ -183,33 +191,39 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         draft_config.num_hidden_layers = args.num_draft_layers
         draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers
-        print_on_rank0("Auto-generated draft config from target model")
+        _print("Auto-generated draft config from target model")
 
     if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
         draft_config.dflash_config = {}
 
     draft_config._attn_implementation = args.attention_backend
-    print_on_rank0(f"Using attention backend: {args.attention_backend}")
+    _print(f"Using attention backend: {args.attention_backend}")
 
     draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
 
-    print_on_rank0(
+    _print(
         f"Draft config: block_size={draft_config.block_size}, "
         f"num_hidden_layers={draft_config.num_hidden_layers}, "
         f"num_target_layers={draft_config.num_target_layers}"
     )
-    print_on_rank0(
+    _print(
         f"Draft model parameters: {sum(p.numel() for p in draft_model.parameters()):,}"
     )
 
     return target_model, draft_model
 
 
-def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
-    """Build train and eval dataloaders."""
+def build_dataloader(args, tokenizer, single_process: bool = False) -> Tuple[DataLoader, Optional[DataLoader]]:
+    """Build train and eval dataloaders.
+
+    Args:
+        single_process: If True, use plain DataLoader without DistributedSampler.
+    """
     import hashlib
+
+    from specforge.data.utils import DataCollatorWithPadding
 
     cache_params_string = (
         f"{args.train_data_path}-"
@@ -236,17 +250,29 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     train_eagle3_dataset = train_eagle3_dataset.filter(
         lambda x: x["loss_mask"].sum() >= min_loss_tokens
     )
-    print_on_rank0(
+    _print(
         f"Filtered train dataset: {original_size} -> {len(train_eagle3_dataset)} samples"
     )
 
-    train_dataloader = prepare_dp_dataloaders(
-        train_eagle3_dataset,
-        args.batch_size,
-        num_workers=args.dataloader_num_workers,
-        shuffle=True,
-        process_group=get_dp_group(),
-    )
+    if single_process:
+        collator = DataCollatorWithPadding()
+        train_dataloader = DataLoader(
+            train_eagle3_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.dataloader_num_workers,
+            collate_fn=collator,
+            drop_last=True,
+            prefetch_factor=2 if args.dataloader_num_workers > 0 else None,
+        )
+    else:
+        train_dataloader = prepare_dp_dataloaders(
+            train_eagle3_dataset,
+            args.batch_size,
+            num_workers=args.dataloader_num_workers,
+            shuffle=True,
+            process_group=get_dp_group(),
+        )
 
     eval_dataloader = None
     if args.eval_data_path:
@@ -262,28 +288,42 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         eval_eagle3_dataset = eval_eagle3_dataset.filter(
             lambda x: x["loss_mask"].sum() >= min_loss_tokens
         )
-        print_on_rank0(
+        _print(
             f"Filtered eval dataset: {eval_original_size} -> {len(eval_eagle3_dataset)} samples"
         )
-        eval_dataloader = prepare_dp_dataloaders(
-            eval_eagle3_dataset,
-            args.batch_size,
-            num_workers=args.dataloader_num_workers,
-            shuffle=False,
-            process_group=get_dp_group(),
-        )
+        if single_process:
+            eval_dataloader = DataLoader(
+                eval_eagle3_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.dataloader_num_workers,
+                collate_fn=collator,
+                drop_last=True,
+                prefetch_factor=2 if args.dataloader_num_workers > 0 else None,
+            )
+        else:
+            eval_dataloader = prepare_dp_dataloaders(
+                eval_eagle3_dataset,
+                args.batch_size,
+                num_workers=args.dataloader_num_workers,
+                shuffle=False,
+                process_group=get_dp_group(),
+            )
 
     return train_dataloader, eval_dataloader
 
 
-def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
-    """Save checkpoint."""
+def save_checkpoint(
+    args, epoch, step, dflash_model, draft_model, optimizer,
+    single_process: bool = False,
+):
+    """Save checkpoint. Supports both FSDP and single-process modes."""
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
-    if dist.get_rank() == 0:
-        os.makedirs(save_dir, exist_ok=True)
-    dist.barrier()
 
-    with FSDP.state_dict_type(dflash_model, StateDictType.FULL_STATE_DICT):
+    if single_process:
+        os.makedirs(save_dir, exist_ok=True)
+
+        # In single-process mode, dflash_model is a plain nn.Module
         state_dict = dflash_model.state_dict()
         draft_state_dict = {
             k.replace("draft_model.", ""): v
@@ -291,34 +331,72 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
             if "draft_model." in k
         }
 
+        torch.save(
+            {
+                "epoch": epoch,
+                "global_step": step,
+                "args": args,
+                **optimizer.state_dict(),
+            },
+            os.path.join(save_dir, "training_state.pt"),
+        )
+
+        draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
+
+        modeling_src = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "specforge",
+            "modeling",
+            "draft",
+            "dflash.py",
+        )
+        modeling_dst = os.path.join(save_dir, "dflash.py")
+        if os.path.exists(modeling_src):
+            shutil.copy(modeling_src, modeling_dst)
+
+        _print(f"Saved checkpoint to {save_dir}")
+    else:
         if dist.get_rank() == 0:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "global_step": step,
-                    "args": args,
-                    **optimizer.state_dict(),
-                },
-                os.path.join(save_dir, "training_state.pt"),
-            )
+            os.makedirs(save_dir, exist_ok=True)
+        dist.barrier()
 
-            draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
+        with FSDP.state_dict_type(dflash_model, StateDictType.FULL_STATE_DICT):
+            state_dict = dflash_model.state_dict()
+            draft_state_dict = {
+                k.replace("draft_model.", ""): v
+                for k, v in state_dict.items()
+                if "draft_model." in k
+            }
 
-            modeling_src = os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "specforge",
-                "modeling",
-                "draft",
-                "dflash.py",
-            )
-            modeling_dst = os.path.join(save_dir, "dflash.py")
-            if os.path.exists(modeling_src):
-                shutil.copy(modeling_src, modeling_dst)
+            if dist.get_rank() == 0:
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "global_step": step,
+                        "args": args,
+                        **optimizer.state_dict(),
+                    },
+                    os.path.join(save_dir, "training_state.pt"),
+                )
 
-            print_on_rank0(f"Saved checkpoint to {save_dir}")
+                draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
 
-    dist.barrier()
+                modeling_src = os.path.join(
+                    os.path.dirname(__file__),
+                    "..",
+                    "specforge",
+                    "modeling",
+                    "draft",
+                    "dflash.py",
+                )
+                modeling_dst = os.path.join(save_dir, "dflash.py")
+                if os.path.exists(modeling_src):
+                    shutil.copy(modeling_src, modeling_dst)
+
+                _print(f"Saved checkpoint to {save_dir}")
+
+        dist.barrier()
 
 
 def record_metrics(
@@ -339,14 +417,85 @@ def record_metrics(
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
 
-    print_on_rank0(
+    _print(
         f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
     )
 
     tracker.log(logdict, step=global_step)
 
 
+def _is_server_mode(args) -> bool:
+    """Check if running in single-process server mode (no torchrun)."""
+    if args.target_model_backend != "sglang-server":
+        return False
+    # torchrun sets WORLD_SIZE env var before dist is initialized
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return world_size <= 1
+
+
+# ── Printing helper that works in both distributed and single-process modes ──
+_SINGLE_PROCESS = False
+
+
+def _print(message):
+    """Print helper that works in both distributed and single-process modes."""
+    if _SINGLE_PROCESS:
+        logger.info(message)
+    else:
+        print_on_rank0(message)
+
+
+def init_single_process_distributed():
+    """Initialize minimal distributed environment for single-process training.
+
+    Some PyTorch ops (e.g., DataCollatorWithPadding) query distributed state.
+    We set up a trivial world_size=1 group so they work.
+    """
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29501")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+
+    dist.init_process_group(backend="nccl", world_size=1, rank=0)
+    torch.cuda.set_device(0)
+
+    # Set up the global groups that specforge.distributed functions expect
+    from specforge import distributed as sf_dist
+
+    # Create trivial device mesh for single GPU
+    device_mesh = dist.device_mesh.init_device_mesh(
+        "cuda", (1, 1), mesh_dim_names=("dp", "tp")
+    )
+    sf_dist._DEVICE_MESH = device_mesh
+    sf_dist._TP_GROUP = device_mesh.get_group("tp")
+    sf_dist._DP_GROUP = device_mesh.get_group("dp")
+    sf_dist._TP_DEVICE_MESH = dist.DeviceMesh.from_group(
+        sf_dist._TP_GROUP, device_type="cuda"
+    )
+    sf_dist._DP_DEVICE_MESH = dist.DeviceMesh.from_group(
+        sf_dist._DP_GROUP, device_type="cuda"
+    )
+
+    # Set up draft groups (needed by DataCollatorWithPadding)
+    draft_device_mesh = dist.device_mesh.init_device_mesh(
+        "cuda", (1, 1), mesh_dim_names=("draft_dp", "sp")
+    )
+    sf_dist._DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
+    sf_dist._DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
+
+    # yunchang SP groups (needed by DataCollatorWithPadding)
+    from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
+
+    set_seq_parallel_pg(1, 1, 0, 1)
+    sf_dist._SP_ULYSSES_GROUP = PROCESS_GROUP.ULYSSES_PG
+    sf_dist._SP_RING_GROUP = PROCESS_GROUP.RING_PG
+
+    logger.info("Initialized single-process distributed environment")
+
+
 def main():
+    global _SINGLE_PROCESS
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -362,8 +511,15 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
-    print_with_rank("Initialized distributed")
+    single_process = _is_server_mode(args)
+    _SINGLE_PROCESS = single_process
+
+    if single_process:
+        init_single_process_distributed()
+        _print("Running in single-process server mode")
+    else:
+        init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+        print_with_rank("Initialized distributed")
 
     draft_model_last_checkpoint = None
     ckpt_info = (0, 0)
@@ -412,20 +568,22 @@ def main():
     else:
         tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
         mask_token_id = tokenizer.mask_token_id
-    print_on_rank0(f"Using mask_token_id: {mask_token_id}")
+    _print(f"Using mask_token_id: {mask_token_id}")
 
     draft_model.mask_token_id = mask_token_id
     draft_model.config.dflash_config["mask_token_id"] = mask_token_id
     draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
-    print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
+    _print(f"dflash_config: {draft_model.config.dflash_config}")
 
-    train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
+    train_dataloader, eval_dataloader = build_dataloader(
+        args, tokenizer, single_process=single_process
+    )
 
     steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
     total_steps = args.num_epochs * steps_per_epoch
-    print_on_rank0(f"Total training steps: {total_steps}")
+    _print(f"Total training steps: {total_steps}")
 
-    print_on_rank0("Loading target embeddings and head...")
+    _print("Loading target embeddings and head...")
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
         embed_key=args.embedding_key,
@@ -445,16 +603,21 @@ def main():
         loss_decay_gamma=args.loss_decay_gamma,
     )
 
-    dflash_model = FSDP(
-        dflash_model,
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-    )
-    print_with_rank("Initialized FSDP")
+    if single_process:
+        # No FSDP: draft model is small (~3.5GB), just keep on GPU in bf16
+        dflash_model = dflash_model.cuda().to(torch.bfloat16)
+        _print("Single-process mode: no FSDP wrapping")
+    else:
+        dflash_model = FSDP(
+            dflash_model,
+            use_orig_params=True,
+            mixed_precision=MixedPrecision(
+                param_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            ),
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        )
+        print_with_rank("Initialized FSDP")
 
     start_epoch = ckpt_info[0]
     global_step = ckpt_info[1]
@@ -472,7 +635,7 @@ def main():
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
-        print_on_rank0(
+        _print(
             f"Restored optimizer/scheduler state: "
             f"epoch={start_epoch}, step={global_step}, "
             f"lr={optimizer.get_learning_rate():.6f}"
@@ -480,18 +643,20 @@ def main():
 
     skip_steps = global_step - start_epoch * len(train_dataloader)
 
-    print_on_rank0(f"Initializing tracker (report_to={args.report_to})...")
+    _print(f"Initializing tracker (report_to={args.report_to})...")
     tracker = create_tracker(args, args.output_dir)
-    print_on_rank0("Tracker initialized successfully.")
+    _print("Tracker initialized successfully.")
 
     last_time = time.time()
-    print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
+    _print(f"Starting training from epoch {start_epoch}, step {global_step}")
 
     for epoch in range(start_epoch, args.num_epochs):
-        train_dataloader.sampler.set_epoch(epoch)
+        if not single_process:
+            train_dataloader.sampler.set_epoch(epoch)
         draft_model.train()
 
-        if dist.get_rank() == 0:
+        is_rank0 = single_process or dist.get_rank() == 0
+        if is_rank0:
             progress_bar = tqdm(
                 train_dataloader, desc=f"Training Epoch {epoch}", leave=True
             )
@@ -518,7 +683,7 @@ def main():
             )
 
             if torch.isnan(loss):
-                print_on_rank0(f"[WARN] NaN loss at step {global_step}, skipping backward")
+                _print(f"[WARN] NaN loss at step {global_step}, skipping backward")
                 optimizer.zero_grad()
             else:
                 (loss / args.accumulation_steps).backward()
@@ -527,25 +692,37 @@ def main():
                 optimizer.step()
 
             if global_step % args.log_interval == 0:
-                loss_log = loss.clone()
-                acc_log = accuracy.clone()
-                dist.all_reduce(loss_log)
-                dist.all_reduce(acc_log)
-                loss_log = loss_log / dist.get_world_size()
-                acc_log = acc_log / dist.get_world_size()
+                if single_process:
+                    record_metrics(
+                        args,
+                        loss.item(),
+                        accuracy.item(),
+                        global_step,
+                        tracker,
+                        optimizer,
+                        train_dataloader,
+                        mode="train",
+                    )
+                else:
+                    loss_log = loss.clone()
+                    acc_log = accuracy.clone()
+                    dist.all_reduce(loss_log)
+                    dist.all_reduce(acc_log)
+                    loss_log = loss_log / dist.get_world_size()
+                    acc_log = acc_log / dist.get_world_size()
 
-                record_metrics(
-                    args,
-                    loss_log.item(),
-                    acc_log.item(),
-                    global_step,
-                    tracker,
-                    optimizer,
-                    train_dataloader,
-                    mode="train",
-                )
+                    record_metrics(
+                        args,
+                        loss_log.item(),
+                        acc_log.item(),
+                        global_step,
+                        tracker,
+                        optimizer,
+                        train_dataloader,
+                        mode="train",
+                    )
 
-            if dist.get_rank() == 0:
+            if is_rank0:
                 elapsed = time.time() - last_time
                 last_time = time.time()
                 progress_bar.set_postfix(
@@ -598,15 +775,25 @@ def main():
 
             if global_step % args.save_interval == 0:
                 save_checkpoint(
-                    args, epoch, global_step, dflash_model, draft_model, optimizer
+                    args, epoch, global_step, dflash_model, draft_model, optimizer,
+                    single_process=single_process,
                 )
 
     save_checkpoint(
-        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
+        args, args.num_epochs, global_step, dflash_model, draft_model, optimizer,
+        single_process=single_process,
     )
 
+    # Shutdown server if using sglang-server backend
+    if single_process and hasattr(target_model, "shutdown"):
+        _print("Sending shutdown to hidden states server...")
+        target_model.shutdown()
+
     tracker.close()
-    destroy_distributed()
+    if not single_process:
+        destroy_distributed()
+    else:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

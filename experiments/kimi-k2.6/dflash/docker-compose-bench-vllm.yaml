@@ -1,0 +1,36 @@
+services:
+  kimi-k2.6-dflash-bench-vllm:
+    image: vllm/vllm-openai-rocm
+    container_name: kimi_k2.6_bench_vllm
+    shm_size: "64g"
+    ipc: host
+    network_mode: host
+    environment:
+      HF_TOKEN: "${HF_TOKEN}"
+      HF_HUB_TRUST_REMOTE_CODE: "1"
+      TRUST_REMOTE_CODE: "true"
+      TRANSFORMERS_TRUST_REMOTE_CODE: "1"
+      ROCR_VISIBLE_DEVICES: "1,2,5,7"
+    volumes:
+      - /root/phat/SpecForge:/workspace/SpecForge
+      - /data3/phat/specforge/dflash/kimi-k2.6:/workspace/checkpoints
+      - /data3/phat/.cache:/root/.cache
+      - /data3/phat/.cache/tmp:/tmp
+    tty: true
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    group_add:
+      - video
+    privileged: true
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    working_dir: /workspace
+    entrypoint: /bin/bash
+    command: >
+      -c "pip install openai 2>&1 | tail -1;
+      bash /workspace/SpecForge/experiments/kimi-k2.6/dflash/bench_vllm.sh"

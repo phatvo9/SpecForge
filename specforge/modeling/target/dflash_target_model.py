@@ -1,25 +1,20 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import logging
+import pickle
+import socket
+import struct
+import time
 from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
-from specforge.distributed import get_tp_group
-
 from .sglang_backend import SGLangRunner
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -79,6 +74,12 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "SGLangDFlashTargetModel":
+        # Lazy imports - only load SGLang when actually using sglang backend
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.server_args import ServerArgs
+        from specforge.distributed import get_tp_group
+        from .sglang_backend import SGLangRunner
+
         tp_size = dist.get_world_size(get_tp_group())
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
@@ -114,10 +115,22 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         super().set_capture_layers(layer_ids)
         if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
-            print(self.model_runner.model.model.layers_to_capture)
+            inner = self.model_runner.model
+            model = getattr(inner, "model", None) or getattr(inner, "language_model", inner)
+            if hasattr(model, "model"):
+                model = model.model
+            print(model.layers_to_capture)
 
     @torch.no_grad
     def _extend(self, reqs):
+        from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+        from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
+
         cache_params = CacheInitParams(
             disable=False,
             req_to_token_pool=self.model_runner.req_to_token_pool,
@@ -138,15 +151,15 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         batch.prepare_for_extend()
 
         if require_mlp_sync(self.model_runner.server_args):
-            Scheduler.prepare_mlp_sync_batch_raw(
+            attn_cp_size = getattr(self.model_runner.server_args, "attn_cp_size", 1)
+            prepare_mlp_sync_batch_raw(
                 batch,
                 dp_size=self.model_runner.server_args.dp_size,
                 attn_tp_size=1,
+                attn_cp_size=attn_cp_size,
                 tp_group=self.model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                speculative_num_draft_tokens=None,
                 require_mlp_tp_gather=require_mlp_tp_gather(
                     self.model_runner.server_args
                 ),
@@ -187,6 +200,9 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
     ) -> DFlashTargetOutput:
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
         reqs, data_cache = [], []
 
@@ -287,6 +303,193 @@ class HFDFlashTargetModel(DFlashTargetModel):
         )
 
 
+class ServerDFlashTargetModel(DFlashTargetModel):
+    """DFlash target model client that connects to a hidden states server via TCP.
+
+    The server (sglang_hidden_server.py) runs the target model under torchrun
+    with TP. This client sends input tensors over TCP and receives hidden states,
+    allowing the training process to run as a single process without torchrun.
+    """
+
+    def __init__(self, host: str, port: int):
+        super().__init__()
+        self.host = host
+        self.port = port
+        self._sock: Optional[socket.socket] = None
+
+    def _connect(self) -> socket.socket:
+        """Establish or return existing connection to the hidden states server."""
+        if self._sock is not None:
+            return self._sock
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Set generous buffer sizes for large tensor transfers
+        self._sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024 * 1024
+        )
+        self._sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024
+        )
+        self._sock.connect((self.host, self.port))
+        logger.info(f"Connected to hidden states server at {self.host}:{self.port}")
+        return self._sock
+
+    def _send_msg(self, obj) -> None:
+        """Send a pickle message with length prefix."""
+        sock = self._connect()
+        data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        sock.sendall(struct.pack(">I", len(data)) + data)
+
+    def _recv_msg(self):
+        """Receive a length-prefixed pickle message."""
+        sock = self._connect()
+        raw_len = self._recvall(sock, 4)
+        if raw_len is None:
+            raise ConnectionError("Server closed connection")
+        msg_len = struct.unpack(">I", raw_len)[0]
+        data = self._recvall(sock, msg_len)
+        if data is None:
+            raise ConnectionError("Server closed connection during recv")
+        return pickle.loads(data)
+
+    @staticmethod
+    def _recvall(sock: socket.socket, n: int) -> Optional[bytes]:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(min(n - len(buf), 16 * 1024 * 1024))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def close(self):
+        """Close the TCP connection."""
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str = None,
+        torch_dtype: torch.dtype = None,
+        device: str = None,
+        cache_dir: Optional[str] = None,
+        host: str = "127.0.0.1",
+        port: int = 29700,
+        **kwargs,
+    ) -> "ServerDFlashTargetModel":
+        instance = cls(host=host, port=port)
+        # Detect distributed rank — only rank 0 connects to server
+        if dist.is_initialized():
+            instance._rank = dist.get_rank()
+            instance._world_size = dist.get_world_size()
+        else:
+            instance._rank = 0
+            instance._world_size = 1
+        if instance._rank == 0:
+            instance._wait_for_server()
+        # Sync all ranks
+        if instance._world_size > 1:
+            dist.barrier()
+        return instance
+
+    def _wait_for_server(self, timeout: int = 600, interval: float = 2.0):
+        """Wait for the hidden states server to become available."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                self._connect()
+                self._send_msg({"type": "health"})
+                resp = self._recv_msg()
+                if resp and resp.get("status") == "ok":
+                    logger.info("Hidden states server is ready")
+                    return
+            except (ConnectionRefusedError, ConnectionError, OSError) as e:
+                logger.info(
+                    f"Waiting for server at {self.host}:{self.port}... ({e})"
+                )
+                self.close()  # Reset connection state
+                time.sleep(interval)
+        raise TimeoutError(
+            f"Hidden states server at {self.host}:{self.port} "
+            f"not ready after {timeout}s"
+        )
+
+    def set_capture_layers(self, layer_ids: List[int]) -> None:
+        """Send set_layers command to the server (rank 0 only)."""
+        super().set_capture_layers(layer_ids)
+        if self._rank == 0:
+            self._send_msg({"type": "set_layers", "layer_ids": layer_ids})
+            resp = self._recv_msg()
+            if resp.get("status") != "ok":
+                raise RuntimeError(f"set_capture_layers failed: {resp}")
+            logger.info(f"Server capture layers set to: {layer_ids}")
+        if self._world_size > 1:
+            dist.barrier()
+
+    @torch.no_grad()
+    def generate_dflash_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> DFlashTargetOutput:
+        """Send tensors to server (rank 0), broadcast hidden states to all ranks."""
+        if self._rank == 0:
+            self._send_msg(
+                {
+                    "type": "forward",
+                    "input_ids": input_ids.cpu(),
+                    "attention_mask": attention_mask.cpu(),
+                    "loss_mask": loss_mask.cpu(),
+                }
+            )
+            resp = self._recv_msg()
+            if "hidden_states" not in resp:
+                raise RuntimeError(f"Forward failed: {resp}")
+            hidden_states = resp["hidden_states"]  # CPU tensor
+        else:
+            hidden_states = None
+
+        # Broadcast hidden states from rank 0 to all ranks
+        if self._world_size > 1:
+            if self._rank == 0:
+                shape = torch.tensor(hidden_states.shape, dtype=torch.long, device="cuda")
+            else:
+                shape = torch.zeros(3, dtype=torch.long, device="cuda")
+            dist.broadcast(shape, src=0)
+
+            if self._rank == 0:
+                hidden_states = hidden_states.cuda()
+            else:
+                hidden_states = torch.zeros(
+                    shape.tolist(), dtype=torch.bfloat16, device="cuda"
+                )
+            dist.broadcast(hidden_states, src=0)
+            hidden_states = hidden_states.cpu()
+
+        return DFlashTargetOutput(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+        )
+
+    def shutdown(self):
+        """Send shutdown command to the server (rank 0 only)."""
+        if self._rank == 0:
+            try:
+                self._send_msg({"type": "shutdown"})
+                self._recv_msg()
+            except Exception:
+                pass
+            self.close()
+
+
 def get_dflash_target_model(
     pretrained_model_name_or_path: str,
     backend: str = "sglang",
@@ -297,6 +500,14 @@ def get_dflash_target_model(
 ) -> DFlashTargetModel:
     if backend == "sglang":
         return SGLangDFlashTargetModel.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device=device,
+            cache_dir=cache_dir,
+            **kwargs,
+        )
+    elif backend == "sglang-server":
+        return ServerDFlashTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,

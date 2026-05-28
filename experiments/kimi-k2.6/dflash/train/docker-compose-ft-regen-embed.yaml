@@ -1,13 +1,11 @@
 services:
-  kimi-k2.6-dflash-train:
+  kimi-k2.6-dflash-ft-regen-embed:
     image: lmsysorg/sglang:v0.5.11-rocm700-mi35x
-    container_name: kimi_k2.6_dflash_train
+    container_name: kimi_k2.6_dflash_ft_regen_embed
     shm_size: "64g"
     ipc: host
     network_mode: host
     environment:
-      HF_TOKEN: "${HF_TOKEN}"
-      HF_HUB_OFFLINE: "1"
       HF_HUB_TRUST_REMOTE_CODE: "1"
       TRUST_REMOTE_CODE: "true"
       TRANSFORMERS_TRUST_REMOTE_CODE: "1"
@@ -54,29 +52,29 @@ services:
       torchrun --standalone --nproc_per_node 4
       /workspace/SpecForge/experiments/kimi-k2.6/dflash/train_dflash_wrapper_kimi.py
       --target-model-path moonshotai/Kimi-K2.6
-      --draft-config-path /workspace/SpecForge/configs/kimi-k2.6-dflash.json
-      --train-data-path /workspace/data/kimi-k2.6-spec-data/pretrain_800k.jsonl
-      --eval-data-path /workspace/data/kimi-k2.6-spec-data/eval_100.jsonl
+      --draft-config-path /workspace/checkpoints/dflash/kimi-k2.6-ft-regen/epoch_0_step_0/config.json
+      --train-data-path /workspace/data/kimi-k2.6-eagle3-data/train_with_reasoning.jsonl
+      --eval-data-path /workspace/data/kimi-k2.6-eagle3-data/eval_with_reasoning.jsonl
       --build-dataset-num-proc 16
-      --output-dir /workspace/checkpoints/dflash/kimi-k2.6-pretrain/
+      --output-dir /workspace/checkpoints/dflash/kimi-k2.6-ft-regen-reasoning/
       --tp-size 4
       --target-model-backend sglang
       --sglang-attention-backend aiter
       --sglang-mem-fraction-static 0.9
-      --sglang-context-length 4096
-      --sglang-max-total-tokens 4096
+      --sglang-context-length 20000
+      --sglang-max-total-tokens 20000
       --trust-remote-code
       --num-epochs 5
       --batch-size 1
-      --accumulation-steps 4
-      --learning-rate 6e-4
+      --accumulation-steps 2
+      --learning-rate 6e-5
       --warmup-ratio 0.05
       --max-grad-norm 1.0
-      --max-length 4096
+      --max-length 20000
       --chat-template kimi-k2-instruct
       --attention-backend sdpa
       --block-size 8
-      --num-anchors 512
+      --num-anchors 650
       --loss-decay-gamma 5.0
       --mask-token-id 163838
       --embedding-key language_model.model.embed_tokens.weight
@@ -84,7 +82,7 @@ services:
       --cache-dir /workspace/cache
       --dist-timeout 600
       --resume
-      --save-interval 10000
-      --eval-interval 2000
-      --log-interval 100
+      --save-interval 2000
+      --eval-interval 500
+      --log-interval 50
       --report-to tensorboard"

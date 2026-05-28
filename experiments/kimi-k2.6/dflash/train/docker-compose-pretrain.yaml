@@ -2,25 +2,19 @@ services:
   kimi-k2.6-dflash-train:
     image: lmsysorg/sglang:v0.5.11-rocm700-mi35x
     container_name: kimi_k2.6_dflash_train
-    shm_size: "64g"
+    shm_size: "16g"
     ipc: host
     network_mode: host
     environment:
-      HF_TOKEN: "${HF_TOKEN}"
-      HF_HUB_OFFLINE: "1"
       HF_HUB_TRUST_REMOTE_CODE: "1"
       TRUST_REMOTE_CODE: "true"
       TRANSFORMERS_TRUST_REMOTE_CODE: "1"
       PYTHONUNBUFFERED: "1"
       PYTHONFAULTHANDLER: "1"
-      ROCR_VISIBLE_DEVICES: "0,3,4,6"
+      ROCR_VISIBLE_DEVICES: "1"
       PIP_CACHE_DIR: "/workspace/cache/pip"
       TRITON_CACHE_DIR: "/workspace/cache/triton"
       TORCHINDUCTOR_CACHE_DIR: "/workspace/cache/torchinductor"
-      AITER_LOG_LEVEL: "WARNING"
-      AITER_JIT_DIR: "/workspace/cache/aiter_jit"
-      AMD_COMGR_CACHE_DIR: "/workspace/cache/comgr"
-      NCCL_DEBUG: "WARN"
     volumes:
       - /root/phat/SpecForge:/workspace/SpecForge
       - /home/claudeuser/specforge_data:/workspace/data:ro
@@ -51,38 +45,35 @@ services:
       ulimit -c 0;
       export GPU_COREDUMP_ENABLE=0;
       pip install --cache-dir /workspace/cache/pip yunchang wandb==0.19.11 2>&1 | tail -1;
-      torchrun --standalone --nproc_per_node 4
+      python3
       /workspace/SpecForge/experiments/kimi-k2.6/dflash/train_dflash_wrapper_kimi.py
       --target-model-path moonshotai/Kimi-K2.6
       --draft-config-path /workspace/SpecForge/configs/kimi-k2.6-dflash.json
       --train-data-path /workspace/data/kimi-k2.6-spec-data/pretrain_800k.jsonl
       --eval-data-path /workspace/data/kimi-k2.6-spec-data/eval_100.jsonl
-      --build-dataset-num-proc 16
-      --output-dir /workspace/checkpoints/dflash/kimi-k2.6-pretrain/
-      --tp-size 4
-      --target-model-backend sglang
-      --sglang-attention-backend aiter
-      --sglang-mem-fraction-static 0.9
-      --sglang-context-length 4096
-      --sglang-max-total-tokens 4096
+      --build-dataset-num-proc 96
+      --output-dir /workspace/checkpoints/dflash/kimi-k2.6-pretrain-v2/
+      --tp-size 1
+      --target-model-backend sglang-server
+      --sglang-server-host 127.0.0.1
+      --sglang-server-port 29700
       --trust-remote-code
       --num-epochs 5
-      --batch-size 1
+      --batch-size 4
       --accumulation-steps 4
       --learning-rate 6e-4
       --warmup-ratio 0.05
       --max-grad-norm 1.0
-      --max-length 4096
+      --max-length 20000
       --chat-template kimi-k2-instruct
       --attention-backend sdpa
       --block-size 8
-      --num-anchors 512
+      --num-anchors 1000
       --loss-decay-gamma 5.0
       --mask-token-id 163838
       --embedding-key language_model.model.embed_tokens.weight
       --lm-head-key language_model.lm_head.weight
       --cache-dir /workspace/cache
-      --dist-timeout 600
       --resume
       --save-interval 10000
       --eval-interval 2000

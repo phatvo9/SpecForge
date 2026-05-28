@@ -19,8 +19,9 @@ export HF_HUB_TRUST_REMOTE_CODE=1
 # All cache env vars set in docker-compose; just create dirs
 mkdir -p /workspace/cache/torchinductor /workspace/cache/triton /workspace/cache/comgr /workspace/cache/tmp /workspace/cache/pip /workspace/cache/aiter_jit
 
-# Only install missing packages, use /workspace/cache for pip cache to avoid filling root disk
-pip install --cache-dir /workspace/cache/pip yunchang wandb==0.19.11 2>&1 | tail -3
+# Install missing packages BEFORE torchrun to avoid import race
+python3 -c "import yunchang" 2>/dev/null || pip install --cache-dir /workspace/cache/pip yunchang 2>&1 | tail -3
+python3 -c "import wandb" 2>/dev/null || pip install --cache-dir /workspace/cache/pip wandb==0.19.11 2>&1 | tail -3
 
 # Kimi K2.6 DFlash pretrain
 # Draft: 6 layers, hidden=7168, 64 heads, 8 KV heads (~3.5GB)
@@ -29,7 +30,7 @@ pip install --cache-dir /workspace/cache/pip yunchang wandb==0.19.11 2>&1 | tail
 # TP=8, DP=1
 
 NUM_GPUS=8
-TP_SIZE=4
+TP_SIZE=8
 
 torchrun \
     --standalone \

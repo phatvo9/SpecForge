@@ -140,7 +140,6 @@ def initialize_model_parallel(
             "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
         ),
         group_name="tp",
-        pynccl_use_current_stream=duplicate_tp_group,
     )
 
     if duplicate_tp_group:
@@ -156,7 +155,6 @@ def initialize_model_parallel(
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
             ),
             group_name="pdmux_prefill_tp",
-            pynccl_use_current_stream=True,
         )
         # NOTE: Check pynccl_comm exists before accessing it (may be None in sglang 0.5.9)
         if parallel_state._TP.pynccl_comm is not None:
@@ -355,10 +353,10 @@ def initialize_dp_attention(
 
     dp_attention._ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
-    # NOTE: Added attn_cp_size parameter for sglang 0.5.9
+    # NOTE: v0.5.11 removed _ATTN_TP_RANK/_ATTN_TP_SIZE from dp_attention
     (
-        dp_attention._ATTN_TP_RANK,
-        dp_attention._ATTN_TP_SIZE,
+        _,
+        _,
         dp_attention._ATTN_DP_RANK,
     ) = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size

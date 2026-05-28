@@ -1,26 +1,81 @@
 services:
-  kimi-k2.6-dflash-train:
+  kimi-k2.6-server:
     image: lmsysorg/sglang:v0.5.11-rocm700-mi35x
-    container_name: kimi_k2.6_dflash_train
+    container_name: kimi_k2.6_server
     shm_size: "64g"
     ipc: host
     network_mode: host
     environment:
-      HF_TOKEN: "${HF_TOKEN}"
-      HF_HUB_OFFLINE: "1"
+      HF_HUB_TRUST_REMOTE_CODE: "1"
+      TRUST_REMOTE_CODE: "true"
+      TRANSFORMERS_TRUST_REMOTE_CODE: "1"
+      PYTHONUNBUFFERED: "1"
+      GPU_COREDUMP_ENABLE: "0"
+      ROCR_VISIBLE_DEVICES: "0,3,4,6"
+      NCCL_DEBUG: "WARN"
+      AITER_LOG_LEVEL: "WARNING"
+      AITER_JIT_DIR: "/workspace/cache/aiter_jit"
+      TRITON_CACHE_DIR: "/workspace/cache/triton"
+      AMD_COMGR_CACHE_DIR: "/workspace/cache/comgr"
+      SGLANG_USE_AITER: "1"
+      SGLANG_ROCM_FUSED_DECODE_MLA: "0"
+    volumes:
+      - /root/phat/SpecForge:/workspace/SpecForge
+      - /data3/phat/.cache:/root/.cache
+      - /data3/phat/.cache/specforge:/workspace/cache
+      - /data3/phat/.cache/specforge/aiter_build:/sgl-workspace/aiter/aiter/jit/build
+      - /data3/phat/.cache/tmp:/tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "2"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    group_add:
+      - video
+    privileged: true
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    working_dir: /workspace/cache
+    command: >
+      bash -c "ulimit -c 0;
+      export PYTHONPATH=/workspace/SpecForge:$$PYTHONPATH;
+      pip install --cache-dir /workspace/cache/pip yunchang 2>&1 | tail -1;
+      torchrun --standalone --nproc_per_node 4
+      -m specforge.modeling.target.sglang_hidden_server
+      --model-path moonshotai/Kimi-K2.6
+      --port 29700
+      --tp-size 4
+      --mem-fraction-static 0.8
+      --attention-backend aiter
+      --context-length 30000
+      --max-total-tokens 65536
+      --trust-remote-code
+      --dist-timeout 600"
+    restart: unless-stopped
+
+  kimi-k2.6-dflash-train:
+    image: lmsysorg/sglang:v0.5.11-rocm700-mi35x
+    container_name: kimi_k2.6_dflash_train
+    shm_size: "16g"
+    ipc: host
+    network_mode: host
+    environment:
       HF_HUB_TRUST_REMOTE_CODE: "1"
       TRUST_REMOTE_CODE: "true"
       TRANSFORMERS_TRUST_REMOTE_CODE: "1"
       PYTHONUNBUFFERED: "1"
       PYTHONFAULTHANDLER: "1"
-      ROCR_VISIBLE_DEVICES: "0,3,4,6"
+      ROCR_VISIBLE_DEVICES: "1"
       PIP_CACHE_DIR: "/workspace/cache/pip"
       TRITON_CACHE_DIR: "/workspace/cache/triton"
       TORCHINDUCTOR_CACHE_DIR: "/workspace/cache/torchinductor"
-      AITER_LOG_LEVEL: "WARNING"
-      AITER_JIT_DIR: "/workspace/cache/aiter_jit"
-      AMD_COMGR_CACHE_DIR: "/workspace/cache/comgr"
-      NCCL_DEBUG: "WARN"
     volumes:
       - /root/phat/SpecForge:/workspace/SpecForge
       - /home/claudeuser/specforge_data:/workspace/data:ro
@@ -46,33 +101,33 @@ services:
       memlock: -1
       stack: 67108864
     working_dir: /workspace/cache
+    depends_on:
+      - kimi-k2.6-server
     command: >
       bash -c "export PYTHONPATH=/workspace/SpecForge:$$PYTHONPATH;
       ulimit -c 0;
       export GPU_COREDUMP_ENABLE=0;
       pip install --cache-dir /workspace/cache/pip yunchang wandb==0.19.11 2>&1 | tail -1;
-      torchrun --standalone --nproc_per_node 4
+      python3
       /workspace/SpecForge/experiments/kimi-k2.6/dflash/train_dflash_wrapper_kimi.py
       --target-model-path moonshotai/Kimi-K2.6
       --draft-config-path /workspace/SpecForge/configs/kimi-k2.6-dflash.json
       --train-data-path /workspace/data/kimi-k2.6-spec-data/pretrain_800k.jsonl
       --eval-data-path /workspace/data/kimi-k2.6-spec-data/eval_100.jsonl
-      --build-dataset-num-proc 16
+      --build-dataset-num-proc 96
       --output-dir /workspace/checkpoints/dflash/kimi-k2.6-pretrain/
-      --tp-size 4
-      --target-model-backend sglang
-      --sglang-attention-backend aiter
-      --sglang-mem-fraction-static 0.9
-      --sglang-context-length 4096
-      --sglang-max-total-tokens 4096
+      --tp-size 1
+      --target-model-backend sglang-server
+      --sglang-server-host 127.0.0.1
+      --sglang-server-port 29700
       --trust-remote-code
       --num-epochs 5
-      --batch-size 1
+      --batch-size 4
       --accumulation-steps 4
       --learning-rate 6e-4
       --warmup-ratio 0.05
       --max-grad-norm 1.0
-      --max-length 4096
+      --max-length 8192
       --chat-template kimi-k2-instruct
       --attention-backend sdpa
       --block-size 8
@@ -82,7 +137,6 @@ services:
       --embedding-key language_model.model.embed_tokens.weight
       --lm-head-key language_model.lm_head.weight
       --cache-dir /workspace/cache
-      --dist-timeout 600
       --resume
       --save-interval 10000
       --eval-interval 2000

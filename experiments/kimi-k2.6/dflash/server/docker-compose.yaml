@@ -1,0 +1,59 @@
+services:
+  kimi-k2.6-server:
+    image: lmsysorg/sglang:v0.5.11-rocm700-mi35x
+    container_name: kimi_k2.6_server
+    shm_size: "64g"
+    ipc: host
+    network_mode: host
+    environment:
+      HF_HUB_TRUST_REMOTE_CODE: "1"
+      TRUST_REMOTE_CODE: "true"
+      TRANSFORMERS_TRUST_REMOTE_CODE: "1"
+      PYTHONUNBUFFERED: "1"
+      GPU_COREDUMP_ENABLE: "0"
+      ROCR_VISIBLE_DEVICES: "0,3,4,6"
+      NCCL_DEBUG: "WARN"
+      AITER_LOG_LEVEL: "WARNING"
+      AITER_JIT_DIR: "/workspace/cache/aiter_jit"
+      TRITON_CACHE_DIR: "/workspace/cache/triton"
+      AMD_COMGR_CACHE_DIR: "/workspace/cache/comgr"
+      SGLANG_USE_AITER: "1"
+      SGLANG_ROCM_FUSED_DECODE_MLA: "0"
+    volumes:
+      - /root/phat/SpecForge:/workspace/SpecForge
+      - /data3/phat/.cache:/root/.cache
+      - /data3/phat/.cache/specforge:/workspace/cache
+      - /data3/phat/.cache/specforge/aiter_build:/sgl-workspace/aiter/aiter/jit/build
+      - /data3/phat/.cache/tmp:/tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "2"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    group_add:
+      - video
+    privileged: true
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    working_dir: /workspace/cache
+    command: >
+      bash -c "ulimit -c 0;
+      export PYTHONPATH=/workspace/SpecForge:$$PYTHONPATH;
+      pip install --cache-dir /workspace/cache/pip yunchang 2>&1 | tail -1;
+      torchrun --standalone --nproc_per_node 4
+      -m specforge.modeling.target.sglang_hidden_server
+      --model-path moonshotai/Kimi-K2.6
+      --port 29700
+      --tp-size 4
+      --mem-fraction-static 0.8
+      --attention-backend aiter
+      --trust-remote-code
+      --dist-timeout 600"
+    restart: unless-stopped
